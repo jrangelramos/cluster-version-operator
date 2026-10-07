@@ -609,6 +609,8 @@ func (optr *Operator) Run(runContext context.Context, shutdownContext context.Co
 		klog.Infof("The ClusterVersionOperatorConfiguration feature gate is disabled or HyperShift is detected; the configuration sync routine will not run.")
 	}
 
+	optr.agenticRunController.StartRequestWatcher(runContext)
+
 	resultChannelCount++
 	go func() {
 		defer utilruntime.HandleCrash()

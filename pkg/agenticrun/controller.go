@@ -16,7 +16,11 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
 	kutilerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/util/workqueue"
@@ -136,6 +140,37 @@ func (c *Controller) Queue() workqueue.TypedRateLimitingInterface[any] {
 
 func (c *Controller) QueueKey() string {
 	return c.queueKey
+}
+
+// StartRequestWatcher watches for AgenticRunRequest CRs and pokes the queue
+// for immediate processing. The watch auto-restarts on expiration.
+func (c *Controller) StartRequestWatcher(ctx context.Context) {
+	go func() {
+		for {
+			watcher, err := c.dynamicClient.Resource(agenticRunRequestGVR).Namespace(agenticRunRequestNamespace).Watch(ctx, metav1.ListOptions{})
+			if err != nil {
+				klog.V(i.Normal).Infof("Failed to watch AgenticRunRequests, retrying: %v", err)
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(10 * time.Second):
+					continue
+				}
+			}
+			for event := range watcher.ResultChan() {
+				if event.Type == watch.Added {
+					klog.V(i.Normal).Info("AgenticRunRequest detected, queueing sync")
+					c.queue.Add(c.queueKey)
+				}
+			}
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				klog.V(i.Normal).Info("AgenticRunRequest watch expired, restarting")
+			}
+		}
+	}()
 }
 
 const crdCheckInterval = 5 * time.Minute
@@ -266,51 +301,74 @@ func (c *Controller) Sync(ctx context.Context, key string) error {
 		}
 	}
 
-	if len(updates) == 0 && len(conditionalUpdates) == 0 {
+	// Process on-demand AgenticRunRequest CRs instead of auto-creating for all paths
+	requests, err := c.listRequests(ctx)
+	if err != nil {
+		errs = append(errs, err)
 		return kutilerrors.NewAggregate(errs)
 	}
 
-	agenticRuns, err := getAgenticRuns(ctx, c.dynamicClient, updates, conditionalUpdates, c.config.Namespace, currentVersion, cv.Spec.Channel, prompt, c.config.SkillsImage)
-	if err != nil {
-		klog.V(i.Normal).Infof("Getting agentic runs hit an error: %v", err)
-		return kutilerrors.NewAggregate(append(errs, err))
-	}
+	for _, req := range requests {
+		reqName := req.GetName()
+		spec, _ := req.Object["spec"].(map[string]interface{})
+		targetVersion, _ := spec["targetVersion"].(string)
+		if targetVersion == "" {
+			klog.V(i.Normal).Infof("AgenticRunRequest %s has no targetVersion, deleting", reqName)
+			c.deleteRequest(ctx, reqName)
+			continue
+		}
 
-	for _, agenticRun := range agenticRuns {
+		target := findUpdateTarget(updates, conditionalUpdates, targetVersion)
+		if target == nil {
+			klog.Warningf("AgenticRunRequest %s targets unknown version %s, deleting", reqName, targetVersion)
+			c.deleteRequest(ctx, reqName)
+			continue
+		}
+
+		name := agenticRunName(currentVersion, targetVersion)
+
+		// Check if an AgenticRun already exists for this target
 		existing := &agenticrunv1alpha1.AgenticRun{}
-		err := c.client.Get(ctx, ctrlruntimeclient.ObjectKey{Name: agenticRun.Name, Namespace: agenticRun.Namespace}, existing)
-		if err != nil {
-			if !kerrors.IsNotFound(err) {
-				klog.V(i.Normal).Infof("Failed to get agentic run %s/%s: %v", agenticRun.Namespace, agenticRun.Name, err)
-				errs = append(errs, err)
-				continue
-			}
-		} else {
-			if !ownedByCVO(existing) {
-				klog.V(i.Normal).Infof("Ignored agentic run %s/%s not owned by CVO", agenticRun.Namespace, agenticRun.Name)
-				continue
-			}
-			if expired(existing) {
-				if err := deleteAgenticRun(ctx, c.client, existing, "expired"); err != nil {
-					errs = append(errs, err)
+		err := c.client.Get(ctx, ctrlruntimeclient.ObjectKey{Name: name, Namespace: c.config.Namespace}, existing)
+		if err == nil {
+			if ownedByCVO(existing) && expired(existing) {
+				if delErr := deleteAgenticRun(ctx, c.client, existing, "expired"); delErr != nil {
+					errs = append(errs, delErr)
+					c.deleteRequest(ctx, reqName)
 					continue
 				}
 			} else {
-				klog.V(i.Debug).Infof("The existing agentic run %s/%s is not expired", agenticRun.Namespace, agenticRun.Name)
+				klog.V(i.Normal).Infof("AgenticRun %s already exists for requested target %s, skipping", name, targetVersion)
+				c.deleteRequest(ctx, reqName)
 				continue
 			}
+		} else if !kerrors.IsNotFound(err) {
+			errs = append(errs, err)
+			c.deleteRequest(ctx, reqName)
+			continue
+		}
+
+		klog.V(i.Normal).Infof("Processing AgenticRunRequest %s for target %s", reqName, targetVersion)
+		readinessJSON := runReadinessJSON(ctx, c.dynamicClient, currentVersion, targetVersion)
+		agenticRun, err := getAgenticRun(c.config.Namespace, currentVersion, targetVersion, cv.Spec.Channel, target.updateKind, prompt, readinessJSON, updates, c.config.SkillsImage)
+		if err != nil {
+			klog.V(i.Normal).Infof("Failed to build agentic run for %s: %v", targetVersion, err)
+			errs = append(errs, err)
+			c.deleteRequest(ctx, reqName)
+			continue
 		}
 
 		if err := c.client.Create(ctx, agenticRun); err != nil {
 			if !kerrors.IsAlreadyExists(err) {
 				klog.V(i.Normal).Infof("Failed to create agentic run %s/%s: %v", agenticRun.Namespace, agenticRun.Name, err)
 				errs = append(errs, err)
-			} else {
-				klog.V(i.Debug).Infof("The agentic run %s/%s existed already", agenticRun.Namespace, agenticRun.Name)
 			}
 		} else {
-			klog.V(i.Debug).Infof("Created agentic run %s/%s", agenticRun.Namespace, agenticRun.Name)
+			klog.V(i.Normal).Infof("Created agentic run %s/%s from request %s", agenticRun.Namespace, agenticRun.Name, reqName)
+			c.autoApproveAnalysis(ctx, agenticRun.Name, agenticRun.Namespace)
 		}
+
+		c.deleteRequest(ctx, reqName)
 	}
 
 	return kutilerrors.NewAggregate(errs)
@@ -527,11 +585,107 @@ const (
 	updateKindConditional = "Conditional"
 
 	agenticRunExpiration = 24 * time.Hour
+
+	agenticRunRequestNamespace = "openshift-cluster-version"
 )
+
+var agenticRunRequestGVR = schema.GroupVersionResource{
+	Group:    "agentic.openshift.io",
+	Version:  "v1alpha1",
+	Resource: "agenticrunrequests",
+}
+
+var agenticRunApprovalGVR = schema.GroupVersionResource{
+	Group:    "agentic.openshift.io",
+	Version:  "v1alpha1",
+	Resource: "agenticrunapprovals",
+}
 
 var (
 	CVOAgenticRunLabels = map[string]string{labelKeySource: labelValueSource}
 )
+
+func (c *Controller) listRequests(ctx context.Context) ([]unstructured.Unstructured, error) {
+	list, err := c.dynamicClient.Resource(agenticRunRequestGVR).Namespace(agenticRunRequestNamespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to list AgenticRunRequests: %w", err)
+	}
+	return list.Items, nil
+}
+
+func (c *Controller) autoApproveAnalysis(ctx context.Context, name, namespace string) {
+	approvalObj := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "agentic.openshift.io/v1alpha1",
+			"kind":       "AgenticRunApproval",
+			"metadata": map[string]interface{}{
+				"name":      name,
+				"namespace": namespace,
+			},
+			"spec": map[string]interface{}{
+				"stages": []interface{}{
+					map[string]interface{}{
+						"type":     "Analysis",
+						"decision": "Approved",
+						"analysis": map[string]interface{}{
+							"agent": "default",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	_, err := c.dynamicClient.Resource(agenticRunApprovalGVR).Namespace(namespace).Create(ctx, approvalObj, metav1.CreateOptions{})
+	if err == nil {
+		klog.V(i.Normal).Infof("Created pre-approved AgenticRunApproval %s/%s", namespace, name)
+		return
+	}
+	if !kerrors.IsAlreadyExists(err) {
+		klog.V(i.Normal).Infof("Failed to create AgenticRunApproval %s/%s: %v", namespace, name, err)
+		return
+	}
+
+	// Approval already exists (operator created it) — patch to add Analysis stage
+	patch := []byte(`{"spec":{"stages":[{"type":"Analysis","decision":"Approved","analysis":{"agent":"default"}}]}}`)
+	_, err = c.dynamicClient.Resource(agenticRunApprovalGVR).Namespace(namespace).Patch(
+		ctx, name, types.MergePatchType, patch, metav1.PatchOptions{},
+	)
+	if err != nil {
+		klog.V(i.Normal).Infof("Failed to patch AgenticRunApproval %s/%s: %v", namespace, name, err)
+	} else {
+		klog.V(i.Normal).Infof("Patched AgenticRunApproval %s/%s with Analysis approval", namespace, name)
+	}
+}
+
+func (c *Controller) deleteRequest(ctx context.Context, name string) {
+	err := c.dynamicClient.Resource(agenticRunRequestGVR).Namespace(agenticRunRequestNamespace).Delete(ctx, name, metav1.DeleteOptions{})
+	if err != nil && !kerrors.IsNotFound(err) {
+		klog.V(i.Normal).Infof("Failed to delete AgenticRunRequest %s: %v", name, err)
+	}
+}
+
+type updateTarget struct {
+	version    string
+	updateKind string
+}
+
+func findUpdateTarget(availableUpdates []configv1.Release, conditionalUpdates []configv1.ConditionalUpdate, targetVersion string) *updateTarget {
+	for _, au := range availableUpdates {
+		if au.Version == targetVersion {
+			return &updateTarget{version: au.Version, updateKind: updateKindRecommended}
+		}
+	}
+	for _, cu := range conditionalUpdates {
+		if cu.Release.Version == targetVersion {
+			return &updateTarget{version: cu.Release.Version, updateKind: updateKindConditional}
+		}
+	}
+	return nil
+}
 
 // classifyUpdate returns "z-stream" if major.minor match, otherwise "minor".
 func classifyUpdate(current, target string) string {
